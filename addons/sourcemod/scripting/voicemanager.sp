@@ -1,16 +1,13 @@
 #pragma semicolon 1
+#pragma newdecls required
 
 #include <voicemanager>
-#include <morecolors>
+#include <multicolors>
 #include <sdktools>
 #include <clientprefs>
 
 #define PLUGIN_VERSION "1.0.2"
-#define VOICE_MANAGER_PREFIX "{green}[VOICE MANAGER]{default}"
-#define TABLE_NAME "voicemanager"
-#define STEAM_ID_BUF_SIZE 18
-
-#pragma newdecls required
+#define VOICE_MANAGER_PREFIX "{green}[Voice Manager]{default}"
 
 int g_iSelection[MAXPLAYERS+1] = {0};
 int g_iCookieSelection[MAXPLAYERS+1] = {-1};
@@ -20,14 +17,13 @@ char g_sDriver[64];
 
 // Cvars
 ConVar g_Cvar_VoiceEnable;
-ConVar g_Cvar_Database;
 ConVar g_Cvar_AllowSelfOverride;
 
 // Cookies
 Handle g_Cookie_GlobalOverride;
 
 // Handles
-Handle g_hDatabase;
+Database g_DB;
 
 public Extension __ext_voicemanager =
 {
@@ -48,7 +44,6 @@ public Plugin myinfo =
 public void OnPluginStart()
 {
     g_Cvar_VoiceEnable = FindConVar("vm_enable");
-    g_Cvar_Database = CreateConVar("vm_database", "default", "Database configuration to use from databases.cfg");
     g_Cvar_AllowSelfOverride = CreateConVar("vm_allow_self", "0", "Allow players to override their own volume (recommended only for testing)");
 
     RegConsoleCmd("sm_vm", CommandBaseMenu);
@@ -59,36 +54,22 @@ public void OnPluginStart()
 
     g_Cookie_GlobalOverride = RegClientCookie("voicemanager_cookie", "VM Global Toggle", CookieAccess_Public);
 
-    SQL_OpenConnection();
+    if (SQL_CheckConfig("voicemanager")) {
+        SetFailState("Database config entry 'voicemanager' not found!");
+    }
+
+    Database.Connect(SQL_OnDatabaseConnected, "voicemanager");
 }
 
-public void SQL_OpenConnection()
+public void SQL_OnDatabaseConnected(Database db, const char[] error, any data)
 {
-    char database[64];
-    g_Cvar_Database.GetString(database, sizeof(database));
-
-    if (SQL_CheckConfig(database))
+    if (db == null)
     {
-        SQL_TConnect(T_InitDatabase, database);
-    }
-    else
-    {
-        SetFailState("Failed to load database config %s from databases.cfg", database);
-    }
-}
-
-public void T_InitDatabase(Handle owner, Handle hndl, const char[] error, any data)
-{
-    if (hndl != INVALID_HANDLE)
-    {
-        g_hDatabase = hndl;
-    }
-    else
-    {
-        SetFailState("DATABASE FAILURE: %s", error);
+        SetFailState("SQL Connection failed! %s", error);
     }
 
-    SQL_ReadDriver(g_hDatabase, g_sDriver, sizeof(g_sDriver));
+    g_DB = db;
+    g_DB.Driver.GetIdentifier(g_sDriver, sizeof(g_sDriver));
 
     if (!StrEqual(g_sDriver, "sqlite") && !StrEqual(g_sDriver, "mysql"))
     {
@@ -96,10 +77,10 @@ public void T_InitDatabase(Handle owner, Handle hndl, const char[] error, any da
     }
 
     // Add voicemanager table if it does not exist
-    char szQuery[511];
-    Format(szQuery, sizeof(szQuery), "CREATE TABLE IF NOT EXISTS `%s` (adjuster VARCHAR(64), adjusted VARCHAR(64), level TINYINT, PRIMARY KEY (adjuster, adjusted))", TABLE_NAME);
+    char query[256];
+    g_DB.Format(query, sizeof(query), "CREATE TABLE IF NOT EXISTS `voicemanager` (adjuster VARCHAR(64), adjusted VARCHAR(64), level INT, PRIMARY KEY (adjuster, adjusted))");
 
-    SQL_TQuery(g_hDatabase, SQLErrorCheckCallback, szQuery);
+    g_DB.Query(SQLErrorCheckCallback, query);
 
     for (int client = 1; client <= MaxClients; client++)
     {
@@ -123,35 +104,39 @@ public void OnClientPostAdminCheck(int client)
         return;
     }
 
-    char szSteamID[STEAM_ID_BUF_SIZE];
-    GetClientAuthId(client, AuthId_SteamID64, szSteamID, sizeof(szSteamID));
+    char steamid[18];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamid, sizeof(steamid))) 
+    {
+        LogError("Could not retrieve %N's Steam ID, not loading voice overrides.", client);
+        return;
+    }
 
     // Load adjustments from database
-    char szQueryBuffer[255];
-    FormatEx(szQueryBuffer, sizeof(szQueryBuffer), "SELECT adjusted, level FROM `%s` WHERE adjuster = '%s'", TABLE_NAME, szSteamID);
-    SQL_TQuery(g_hDatabase, T_LoadAdjustments, szQueryBuffer, client);
+    char query[256];
+    g_DB.Format(query, sizeof(query), "SELECT adjusted, level FROM `voicemanager` WHERE adjuster = '%s'", steamid);
+    g_DB.Query(SQL_OnAdjustmentsReceived, query, GetClientUserId(client));
 }
 
-public void T_LoadAdjustments(Handle owner, Handle hndl, const char[] error, int client)
+public void SQL_OnAdjustmentsReceived(Database db, DBResultSet results, const char[] error, int userid)
 {
-    if (hndl == INVALID_HANDLE || strlen(error) > 1)
+    if (db == null || error[0] != '\0')
     {
         LogError("[VoiceManager] Failed to load adjustments: %s", error);
         return;
     }
 
-    if (SQL_GetRowCount(hndl))
+    int client = GetClientOfUserId(userid);
+    if (!IsValidClient(client))
     {
-        while (SQL_FetchRow(hndl))
-        {
-            // Fetch adjusted steam ids with levels from SQL
-            char adjustedSteamId[STEAM_ID_BUF_SIZE];
-            SQL_FetchString(hndl, 0, adjustedSteamId, sizeof(adjustedSteamId));
+        return;
+    }
 
-            int level = SQL_FetchInt(hndl, 1);
-
-            LoadPlayerAdjustment(client, adjustedSteamId, level);
-        }
+    while (results.FetchRow())
+    {
+        char steamid[18];
+        results.FetchString(0, steamid, sizeof(steamid));
+        int level = results.FetchInt(1);
+        LoadPlayerAdjustment(client, steamid, level);
     }
 
     RefreshActiveOverrides();
@@ -159,13 +144,13 @@ public void T_LoadAdjustments(Handle owner, Handle hndl, const char[] error, int
 
 public void OnClientCookiesCached(int client)
 {
-    char sCookieValue[12];
-    GetClientCookie(client, g_Cookie_GlobalOverride, sCookieValue, sizeof(sCookieValue));
+    char cookie[12];
+    GetClientCookie(client, g_Cookie_GlobalOverride, cookie, sizeof(cookie));
 
     // This is because cookies default to empty and otherwise we use 0 as our lowest volume setting
-    if (sCookieValue[0] != '\0')
+    if (cookie[0] != '\0')
     {
-        int cookieValue = StringToInt(sCookieValue);
+        int cookieValue = StringToInt(cookie);
         g_iCookieSelection[client] = cookieValue;
         OnPlayerGlobalAdjust(client, cookieValue);
     }
@@ -321,12 +306,12 @@ public Action Command_ClearClientOverrides(int client, int args)
         return Plugin_Handled;
     }
 
-    char szSteamID[STEAM_ID_BUF_SIZE];
-    GetClientAuthId(client, AuthId_SteamID64, szSteamID, sizeof(szSteamID));
+    char steamid[18];
+    GetClientAuthId(client, AuthId_SteamID64, steamid, sizeof(steamid));
 
     char szQuery[511];
-    FormatEx(szQuery, sizeof(szQuery), "DELETE FROM `%s` WHERE adjuster = '%s'", TABLE_NAME, szSteamID);
-    SQL_TQuery(g_hDatabase, SQLErrorCheckCallback, szQuery);
+    FormatEx(szQuery, sizeof(szQuery), "DELETE FROM `voicemanager` WHERE adjuster = '%s'", steamid);
+    SQL_TQuery(g_DB, SQLErrorCheckCallback, szQuery);
 
     ClearClientOverrides(client);
 
@@ -338,12 +323,12 @@ public Action Command_ClearClientOverrides(int client, int args)
 
 public void OnClearClientOverrides(int client)
 {
-    char szSteamID[STEAM_ID_BUF_SIZE];
-    GetClientAuthId(client, AuthId_SteamID64, szSteamID, sizeof(szSteamID));
+    char steamid[18];
+    GetClientAuthId(client, AuthId_SteamID64, steamid, sizeof(steamid));
 
     char szQuery[511];
-    FormatEx(szQuery, sizeof(szQuery), "DELETE FROM `%s` WHERE adjuster = '%s'", TABLE_NAME, szSteamID);
-    SQL_TQuery(g_hDatabase, SQLErrorCheckCallback, szQuery);
+    FormatEx(szQuery, sizeof(szQuery), "DELETE FROM `voicemanager` WHERE adjuster = '%s'", steamid);
+    SQL_TQuery(g_DB, SQLErrorCheckCallback, szQuery);
 
     ClearClientOverrides(client);
 
@@ -436,39 +421,39 @@ public int VoiceVolumeHandler(Menu menu, MenuAction action, int client, int para
                 CPrintToChat(client, "%s %N's level is now set to %s.", VOICE_MANAGER_PREFIX, g_iSelection[client], setting);
             }
 
-            char adjuster[STEAM_ID_BUF_SIZE], adjusted[STEAM_ID_BUF_SIZE];
+            char adjuster[18], adjusted[18];
             GetClientAuthId(client, AuthId_SteamID64, adjuster, sizeof(adjuster));
             GetClientAuthId(client, AuthId_SteamID64, adjusted, sizeof(adjusted));
 
             char szQuery[511];
             if (level == -1)
             {
-                FormatEx(szQuery, sizeof(szQuery), "DELETE FROM `%s` WHERE adjuster = '%s' AND adjusted = '%s'", TABLE_NAME, adjuster, adjusted);
-                SQL_TQuery(g_hDatabase, SQLErrorCheckCallback, szQuery);
+                FormatEx(szQuery, sizeof(szQuery), "DELETE FROM `voicemanager` WHERE adjuster = '%s' AND adjusted = '%s'", adjuster, adjusted);
+                SQL_TQuery(g_DB, SQLErrorCheckCallback, szQuery);
             }
             else
             {
                 char driver[64];
-                SQL_ReadDriver(g_hDatabase, driver, sizeof(driver));
+                SQL_ReadDriver(g_DB, driver, sizeof(driver));
 
                 if (StrEqual(driver, "sqlite"))
                 {
                     FormatEx(szQuery, sizeof(szQuery), "\
-                        INSERT INTO `%s` (adjuster, adjusted, level)\
+                        INSERT INTO `voicemanager` (adjuster, adjusted, level)\
                         VALUES ('%s', '%s', %d)\
                         ON CONFLICT(adjuster, adjusted) DO UPDATE SET level = %d",
-                    TABLE_NAME, adjuster, adjusted, level, level);
+                    adjuster, adjusted, level, level);
                 }
                 else
                 {
                     FormatEx(szQuery, sizeof(szQuery), "\
-                        INSERT INTO `%s` (adjuster, adjusted, level)\
+                        INSERT INTO `voicemanager` (adjuster, adjusted, level)\
                         VALUES ('%s', '%s', %d)\
                         ON DUPLICATE KEY UPDATE level = %d",
-                    TABLE_NAME, adjuster, adjusted, level, level);
+                    adjuster, adjusted, level, level);
                 }
 
-                SQL_TQuery(g_hDatabase, SQLErrorCheckCallback, szQuery);
+                SQL_TQuery(g_DB, SQLErrorCheckCallback, szQuery);
             }
         }
     }
